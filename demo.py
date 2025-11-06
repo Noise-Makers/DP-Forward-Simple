@@ -175,7 +175,6 @@ class EmbeddingDataset(TorchDataset):
         }
 
 
-@dataclass
 class ComputeServer:
     def __init__(self, config: Gate2Compute):
         self.config = config
