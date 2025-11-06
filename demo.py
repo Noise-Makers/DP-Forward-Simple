@@ -195,8 +195,6 @@ class ComputeServer:
         eval_dataset = {}
         if "validation" in self.config.payload["splits"]:
             eval_flag = True
-
-        if eval_flag is True:
             eval_dataset = self._build_dataset(self.config.payload["splits"]["validation"])
 
         config = AutoConfig.from_pretrained(
@@ -242,7 +240,7 @@ class ComputeServer:
         logger.info(f"[算力网]-开始进行微调，样本规模为 {len(train_dataset)}")
         trainer.train()
 
-        if eval_flag is True:
+        if eval_flag:
             logger.info(f"[算力网]-开始验证")
             metrics = trainer.evaluate()
             print(f"验证结果为：{metrics}")
