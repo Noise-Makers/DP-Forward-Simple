@@ -190,7 +190,14 @@ class ComputeServer:
         set_seed(self.config.seed)
 
         train_dataset = self._build_dataset(self.config.payload["splits"]["train"])
-        eval_dataset = self._build_dataset(self.config.payload["splits"]["validation"])
+
+        eval_flag = False
+        eval_dataset = {}
+        if "validation" in self.config.payload["splits"]:
+            eval_flag = True
+
+        if eval_flag is True:
+            eval_dataset = self._build_dataset(self.config.payload["splits"]["validation"])
 
         config = AutoConfig.from_pretrained(
             self.config.model_name,
@@ -235,10 +242,10 @@ class ComputeServer:
         logger.info(f"[算力网]-开始进行微调，样本规模为 {len(train_dataset)}")
         trainer.train()
 
-        logger.info(f"[算力网]-开始验证")
-        metrics = trainer.evaluate()
-        print(f"验证结果为：{metrics}")
-        return metrics
+        if eval_flag is True:
+            logger.info(f"[算力网]-开始验证")
+            metrics = trainer.evaluate()
+            print(f"验证结果为：{metrics}")
 
 
 if __name__ == '__main__':
