@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -20,12 +21,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class UserClientConfig:
     train_file: str  # 训练数据集的路径
-    validation_file: str | None = None  # 验证数据集的路径
+    validation_file: Optional[str] = None  # 验证数据集的路径
     model_name: str = "bert-base-uncased"  # 预训练模型的名称
     text_column: str = "sentence"  # 数据集文本对应标识
     label_column: str = "label"  # 数据集标签对应标识
-    max_train_samples: int | None = None  # 训练样本的选择上限
-    max_eval_samples: int | None = None  # 验证样本的选择上限
+    max_train_samples: Optional[int] = None  # 训练样本的选择上限
+    max_eval_samples: Optional[int] = None  # 验证样本的选择上限
 
 
 # ------------------------------------------------------
@@ -36,14 +37,14 @@ class UserClientConfig:
 class GatewayConfig:
     max_length: int = 64  # 填充长度
     add_noise: bool = False  # 预留，开启则为添加噪声
-    dp_parameters: list | None = None  # 预留，加噪相关参数
+    dp_parameters: Optional[List] = None  # 预留，加噪相关参数
 
 
 @dataclass
 class Gate2Compute:
     # 定义算安保的输出格式，用来传输给算力网
     model_name: str  # 预训练模型的名称
-    payload: dict  # 处理后的用户数据集
+    payload: Dict  # 处理后的用户数据集
     # 以下是训练相关的参数
     output_dir: str = "output"  # 输出目录
     learning_rate: float = 2e-5  # 学习率
@@ -91,7 +92,7 @@ class PrivacyGateway:
         # 根据用户设置的样本大小，选定的最终数据集
         return payload
 
-    def sanitize(self, payload: dict) -> dict:
+    def sanitize(self, payload: Dict) -> Dict:
         # 对 payload 转换为 embeddings，然后加噪（加噪部分待实现）
         text_col = payload["text_column"]
         label_col = payload["label_column"]
@@ -105,7 +106,7 @@ class PrivacyGateway:
             sanitized_split["labels"] = labels
             sanitized_payload["splits"][split_name] = sanitized_split
             logger.info(
-                f"[算安保]-处理 {split_name} 数据集 -> embeddings 形式 {tuple(sanitized_split["embeddings"].shape)}"
+                f"[算安保]-处理 {split_name} 数据集 -> embeddings 形式"
             )
         self.payload = sanitized_payload
         return sanitized_payload
@@ -115,7 +116,7 @@ class PrivacyGateway:
                                       payload=self.payload)
         return output_content
 
-    def _subset(self, dataset: dict, split: str, limit: int | None) -> dict[str, list]:
+    def _subset(self, dataset: Dict, split: str, limit: Optional[int]) -> Dict[str, List]:
         data = dataset[split]
         if limit is not None:
             limit = min(limit, len(data))
@@ -123,7 +124,7 @@ class PrivacyGateway:
         return data.to_dict()
 
     @torch.no_grad()
-    def _encode_split(self, texts: list[str]) -> dict[str, torch.Tensor]:
+    def _encode_split(self, texts: List[str]) -> Dict[str, torch.Tensor]:
         encodings = self.tokenizer(
             texts,
             padding="max_length",
@@ -179,14 +180,14 @@ class ComputeServer:
     def __init__(self, config: Gate2Compute):
         self.config = config
 
-    def _build_dataset(self, split: dict[str, torch.Tensor]) -> EmbeddingDataset:
+    def _build_dataset(self, split: Dict[str, torch.Tensor]) -> EmbeddingDataset:
         return EmbeddingDataset(
             embeddings=split["embeddings"],
             attention_mask=split["attention_mask"],
             labels=split["labels"]
         )
 
-    def fine_tune(self) -> dict:
+    def fine_tune(self) -> Dict:
         set_seed(self.config.seed)
 
         train_dataset = self._build_dataset(self.config.payload["splits"]["train"])

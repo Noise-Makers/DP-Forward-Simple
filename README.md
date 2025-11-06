@@ -8,7 +8,7 @@
 pip3 install -r ./requirements.txt
 ```
 
-执行 `python3 ./demo.py` 即可。在 3.12.1 版本的 python 环境中运行通过。默认输出结果保存在 `output` 目录
+执行 `python3 ./demo.py` 即可。在 3.8.20 版本的 python 环境中运行通过。默认输出结果保存在 `output` 目录
 
 ## 说明
 
