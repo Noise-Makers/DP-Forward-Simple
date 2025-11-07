@@ -462,7 +462,7 @@ class ComputeServer:
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s : %(message)s")
+                        format="%(asctime)s : %(message)s", force=True)
 
     # ========== 配置参数 ==========
     user_config = UserClientConfig(
@@ -518,7 +518,7 @@ if __name__ == '__main__':
         gate_config=GatewayConfig(
             add_noise=True,
             auto_norm_c=True,       # 自动估计
-            norm_percentile=50,     # 使用中位数（而非90分位）
+            norm_percentile=100,     # 使用中位数（而非90分位）
             epsilon=8.0,
             delta=1e-5,
         )
