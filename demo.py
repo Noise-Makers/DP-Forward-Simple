@@ -19,26 +19,53 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------
 # 差分隐私噪声相关函数
 # ------------------------------------------------------
-def _compute_noise_multiplier(epsilon, delta, sensitivity):
+
+def matrix_gaussian_noise(epsilon: float, delta: float, sensitivity: float) -> float:
     """
-    计算高斯噪声的 noise_multiplier (基于 analytic Gaussian mechanism)
+    计算 Analytic Gaussian mechanism 的噪声强度
 
     Args:
         epsilon: 隐私预算
-        delta: 隐私参数
-        sensitivity: 敏感度 (裁剪后为 2 * norm_c)
+        delta: 失败概率 （通常是 1e-5）
+        sensitivity: 查询的敏感度
 
     Returns:
-        noise_b: 噪声标准差
+        噪声因子
     """
-    # 使用 analytic Gaussian mechanism 的简化公式
-    # 对于 local DP，我们使用标准高斯机制的公式
-    sigma = math.sqrt(2 * math.log(1.25 / delta)) / epsilon
-    noise_b = sensitivity * sigma
-    return noise_b
+    def function_phi(t):
+        return (1 + math.erf(t / math.sqrt(2))) / 2
+
+    def B_plus_function(v, eps):
+        return function_phi(math.sqrt(eps * v)) - math.exp(eps) * \
+               function_phi(-math.sqrt(eps * (v + 2)))
+
+    def B_minus_function(u, eps):
+        return function_phi(-math.sqrt(eps * u)) - math.exp(eps) * \
+               function_phi(-math.sqrt(eps * (u + 2)))
+
+    def compute_R(eps, delta_value, iterations=5000):
+        delta_0 = function_phi(0) - math.exp(eps) * function_phi(-math.sqrt(2 * eps))
+        start, end = 0, 1e5
+        B_function = B_plus_function if delta_value >= delta_0 else B_minus_function
+        for _ in range(iterations):
+            mid = (start + end) / 2
+            value = B_function(mid, eps)
+            if value < delta_value:
+                end = mid
+            else:
+                start = mid
+        u_star = end
+        if delta_value >= delta_0:
+            alpha = math.sqrt(1 + u_star / 2) - math.sqrt(u_star / 2)
+        else:
+            alpha = math.sqrt(1 + u_star / 2) + math.sqrt(u_star / 2)
+        return math.sqrt(2 * eps) / alpha
+
+    R = compute_R(epsilon, delta)
+    return sensitivity / R
 
 
-def _max_norm_clip(embeddings, norm_c=1.0):
+def _max_norm_clip(embeddings: torch.Tensor, norm_c: float = 1.0) -> torch.Tensor:
     """
     对 embeddings 进行范数裁剪
 
@@ -52,32 +79,46 @@ def _max_norm_clip(embeddings, norm_c=1.0):
     shape = embeddings.shape
     # 将每个样本展平为一维向量
     embeddings_flat = embeddings.reshape(shape[0], -1)
-
     # 计算每个样本的 L2 范数
-    total_norm = torch.norm(embeddings_flat, dim=-1, keepdim=True)
-
+    total_norm = torch.norm(embeddings_flat, dim=-1)
     # 计算裁剪系数（只裁剪超过 norm_c 的）
     clip_coef = norm_c / (total_norm + 1e-6)
     clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
-
     # 应用裁剪
-    embeddings_flat = embeddings_flat * clip_coef_clamped
-
+    embeddings_flat = embeddings_flat * clip_coef_clamped.unsqueeze(-1)
     return embeddings_flat.reshape(shape)
 
 
-def _add_gaussian_noise(embeddings, noise_multiplier):
+def add_noise_with_norm_control(
+    embeddings: torch.Tensor,
+    noise_factor: float,
+    norm_c: float,
+    add_noise: bool = True
+) -> torch.Tensor:
     """
-    添加高斯噪声
+    添加高斯噪声，同时控制噪声向量的整体范数
 
     Args:
         embeddings: 裁剪后的 embeddings
-        noise_multiplier: 噪声强度（标准差）
+        noise_factor: 噪声强度（标准差）
+        norm_c: 范数
+        add_noise: 是否加噪
 
     Returns:
         加噪后的 embeddings
     """
-    noise = torch.randn_like(embeddings) * noise_multiplier
+    if not add_noise:
+        return embeddings
+
+    embeddings = _max_norm_clip(embeddings, norm_c)
+    noise = torch.randn_like(embeddings)
+
+    batch_size = embeddings.shape[0]
+    for i in range(batch_size):
+        noise_flat = noise[i].reshape(-1)
+        noise_norm = torch.norm(noise_flat)
+        if noise_norm > 1e-6:
+            noise[i] = noise[i] * (noise_factor / noise_norm)
     return embeddings + noise
 
 
@@ -91,8 +132,18 @@ class UserClientConfig:
     model_name: str = "bert-base-uncased"  # 预训练模型的名称
     text_column: str = "sentence"  # 数据集文本对应标识
     label_column: str = "label"  # 数据集标签对应标识
-    max_train_samples: Optional[int] = None  # 训练样本的选择上限
-    max_eval_samples: Optional[int] = None  # 验证样本的选择上限
+    max_train_samples: Optional[int] = 200  # 训练样本的选择上限
+    max_eval_samples: Optional[int] = 100  # 验证样本的选择上限
+
+
+# 差分隐私相关参数格式
+@dataclass
+class DPConfig:
+    epsilon: float = 8.0  # 隐私预算
+    delta: float = 1e-5  # 错误概率
+    norm_c: float = 5.0  # 裁剪阈值
+    add_noise: bool = True  # 是否加噪
+    add_noise_inference: bool = False  # 推理是否加噪
 
 
 # ------------------------------------------------------
@@ -102,12 +153,7 @@ class UserClientConfig:
 @dataclass
 class GatewayConfig:
     max_length: int = 128  # 填充长度（推荐值）
-    add_noise: bool = False  # 是否添加噪声
-    auto_norm_c: bool = False  # 是否自动估计 norm_c（默认使用论文推荐值）
-    epsilon: float = 8.0  # 隐私预算（默认值）
-    delta: float = 1e-5  # 隐私参数
-    norm_c: float = 1.0  # 裁剪阈值（论文推荐值，如果 auto_norm_c=True 会被覆盖）
-    norm_percentile: int = 50  # 自动估计时使用第几百分位（推荐使用中位数）
+    dp_config: Optional[DPConfig] = None
 
 
 @dataclass
@@ -136,52 +182,103 @@ class PrivacyGateway:
         self.model = AutoModelForSequenceClassification.from_pretrained(
                      user_config.model_name)
         self.model.eval()
+        self.payload: Optional[Dict] = None
 
+        self.dp_config = gate_config.dp_config
         # 如果需要添加噪声，初始化相关参数
-        if gate_config.add_noise:
+        if self.dp_config and self.dp_config.add_noise:
             self._setup_noise_parameters()
 
     def _setup_noise_parameters(self):
         """设置噪声相关参数"""
-        logger.info(f"[算安保]-配置差分隐私参数:")
-        logger.info(f"  epsilon = {self.gate_config.epsilon}")
-        logger.info(f"  delta = {self.gate_config.delta}")
-
-        # 如果需要自动估计 norm_c，先用少量样本估计
-        if self.gate_config.auto_norm_c:
-            logger.info(f"  启用自动估计 norm_c...")
-            # 注意：这里会在第一次调用 sanitize 时进行估计
-            self._norm_c_estimated = False
-        else:
-            logger.info(f"  norm_c = {self.gate_config.norm_c}")
-            self._norm_c_estimated = True
-            self._compute_noise_params()
-
-    def _estimate_norm_c(self, sample_texts: List[str]):
-        """
-        基于样本数据估计合适的 norm_c
-
-        Args:
-            sample_texts: 用于估计的文本样本
-        """
-        if self._norm_c_estimated:
+        dp_cfg = self.dp_config
+        if dp_cfg is None or not dp_cfg.add_noise:
+            logger.info("[算安保]-噪声关闭，使用明文 embeddings（不加噪声）")
             return
 
-        logger.info("[算安保]-正在估计合适的 norm_c（使用100个样本）...")
+        sensitivity = dp_cfg.norm_c
+        self.noise_factor = matrix_gaussian_noise(
+                            dp_cfg.epsilon,
+                            dp_cfg.delta,
+                            sensitivity)
+        logger.info(f"[算安保]-DP配置：ε={dp_cfg.epsilon}, δ={dp_cfg.delta},\
+norm_c={dp_cfg.norm_c}")
+        logger.info(f"[算安保]-噪声因子 = {self.noise_factor:.4f}")
 
-        # 限制样本数量以加快估计
-        sample_texts = sample_texts[:100]
+        signal_norm = dp_cfg.norm_c
+        snr = signal_norm / (self.noise_factor + 1e-12 )
+        logger.info(f"[算安保]-估计 SNR = {snr:.4f}")
 
-        # 获取 embeddings（不加噪声）
+    def load_data(self) -> Dict[str, Dict[str, List]]:
+        # 分隔符，tsv 格式为 "\t"，csv 格式为 ","
+        delimiter = "\t" if self.user_config.train_file.endswith(".tsv") else ","
+        data_files = {"train": self.user_config.train_file}
+        if self.user_config.validation_file:
+            data_files["validation"] = self.user_config.validation_file
+        logger.info(f"[算安保]-加载数据集：{data_files}")
+
+        # 直接使用 load_dataset 对原始数据进行转换
+        dataset = load_dataset("csv", data_files=data_files, delimiter=delimiter)
+
+        train_data = self._subset(dataset, "train", self.user_config.max_train_samples)
+        payload = {
+            "text_column": self.user_config.text_column,
+            "label_column": self.user_config.label_column,
+            "splits": {"train": train_data}
+        }
+        if "validation" in dataset:
+            eval_data = self._subset(dataset, "validation",
+                                     self.user_config.max_eval_samples)
+            payload["splits"]["validation"] = eval_data
+        # 根据用户设置的样本大小，选定的最终数据集
+        return payload
+
+    def sanitize(self, raw_payload: Dict) -> Dict:
+        # 对 raw payload 转换为 embeddings，然后加噪
+        text_col = raw_payload["text_column"]
+        label_col = raw_payload["label_column"]
+
+        sanitized_payload = {"splits": {}}
+
+        for split_name, split_data in raw_payload["splits"].items():
+            texts = split_data[text_col]
+            labels = split_data[label_col]
+
+            # sanitized_split = self._encode_split(texts)
+            # sanitized_split["labels"] = labels
+            sanitized_payload["splits"][split_name] = self._encode_split(texts, labels)
+
+            logger.info(
+                f"[算安保]-处理 {split_name} 数据集 -> embeddings 形式"
+                f"{' (已加噪)' if self.dp_config and self.dp_config.add_noise else ''}"
+            )
+
+        self.payload = sanitized_payload
+        return sanitized_payload
+
+    def output(self) -> Gate2Compute:
+        if self.payload is None:
+            raise ValueError("请先调用 sanitize() 生成加噪后的 payload")
+        return Gate2Compute(model_name=self.user_config.model_name,
+                            payload=self.payload)
+
+    def _subset(self, dataset, split: str, limit: Optional[int]) -> Dict[str, List]:
+        data = dataset[split]
+        if limit is not None:
+            limit = min(limit, len(data))
+            data = data.select(range(limit))
+        return data.to_dict()
+
+    # @torch.no_grad()
+    def _encode_split(self, texts: List[str], labels: List[int]) -> Dict[str, torch.Tensor]:
         with torch.no_grad():
             encodings = self.tokenizer(
-                sample_texts,
+                texts,
                 padding="max_length",
                 truncation=True,
                 max_length=self.gate_config.max_length,
                 return_tensors="pt"
             )
-
             base_model = self.model.base_model
             outputs = base_model(
                 input_ids=encodings["input_ids"],
@@ -192,174 +289,19 @@ class PrivacyGateway:
             )
             embeddings = outputs.hidden_states[0]
 
-            # 计算每个样本的范数
-            embeddings_flat = embeddings.reshape(embeddings.shape[0], -1)
-            norms = torch.norm(embeddings_flat, dim=-1).cpu().numpy()
-
-        # 使用指定百分位作为 norm_c
-        suggested_norm_c = float(np.percentile(norms, self.gate_config.norm_percentile))
-
-        # 统计信息
-        median_norm = float(np.median(norms))
-        max_norm = float(np.max(norms))
-        clipped_ratio = (norms > suggested_norm_c).mean() * 100
-
-        logger.info(f"[算安保]-范数统计：")
-        logger.info(f"  中位数: {median_norm:.4f}")
-        logger.info(f"  {self.gate_config.norm_percentile}th percentile: {suggested_norm_c:.4f}")
-        logger.info(f"  最大值: {max_norm:.4f}")
-        logger.info(f"  将被裁剪的样本比例: {clipped_ratio:.1f}%")
-        logger.info(f"  自动设置 norm_c = {suggested_norm_c:.4f}")
-
-        # 警告：如果 norm_c 太大，会导致噪声过大
-        if suggested_norm_c > 50:
-            logger.warning(
-                f"  ⚠️  自动估计的 norm_c={suggested_norm_c:.1f} 过大！\n"
-                f"  这会导致噪声强度过大（noise ∝ norm_c），SNR 可能很低。\n"
-                f"  建议：\n"
-                f"    1. 使用论文推荐的 norm_c=1.0（更激进的裁剪，但噪声小得多）\n"
-                f"    2. 或使用 norm_percentile=50（中位数）而非 {self.gate_config.norm_percentile}"
-            )
-
-        # 更新配置
-        self.gate_config.norm_c = suggested_norm_c
-        self._norm_c_estimated = True
-
-        # 计算噪声参数
-        self._compute_noise_params()
-
-    def _compute_noise_params(self):
-        """计算噪声强度"""
-        # 敏感度 = 2 * norm_c（两个样本最多差异）
-        sensitivity = 2.0 * self.gate_config.norm_c
-
-        # 计算噪声强度
-        self.noise_multiplier = _compute_noise_multiplier(
-            epsilon=self.gate_config.epsilon,
-            delta=self.gate_config.delta,
-            sensitivity=sensitivity
-        )
-
-        logger.info(f"[算安保]-噪声参数:")
-        logger.info(f"  sensitivity = {sensitivity:.4f}")
-        logger.info(f"  noise_multiplier = {self.noise_multiplier:.4f}")
-
-        # 估计 SNR（信噪比）
-        n = self.gate_config.max_length
-        d = 768  # BERT-base hidden size
-        signal_per_entry = self.gate_config.norm_c / np.sqrt(n * d)
-        noise_per_entry = self.noise_multiplier / np.sqrt(n * d)
-        snr = signal_per_entry / noise_per_entry
-
-        logger.info(f"  估计 SNR = {snr:.4f}")
-        if snr < 0.5:
-            logger.warning(f"  ⚠️  SNR 太低！考虑增大 epsilon 或减小 norm_c")
-        elif snr < 1.0:
-            logger.warning(f"  ⚠️  SNR 较低，准确度可能明显下降")
-        elif snr < 2.0:
-            logger.info(f"  ✓  SNR 适中")
-        else:
-            logger.info(f"  ✓  SNR 良好")
-
-    def load_data(self):
-        # 分隔符，tsv 格式为 "\t"，csv 格式为 ","
-        delimiter = "\t" if self.user_config.train_file.endswith(".tsv") else ","
-        data_files = {"train": self.user_config.train_file}
-        if self.user_config.validation_file is not None:
-            data_files.setdefault("validation", self.user_config.validation_file)
-        logger.info(f"[算安保]-加载数据集：{data_files}")
-        # 直接使用 load_dataset 对原始数据进行转换
-        dataset = load_dataset("csv", data_files=data_files, delimiter=delimiter)
-
-        train_data = self._subset(dataset, "train", self.user_config.max_train_samples)
-        payload = {
-            "text_column": self.user_config.text_column,
-            "label_column": self.user_config.label_column,
-            "splits": {
-                "train": train_data
-            }
+            # 添加噪声
+            if self.dp_config and self.dp_config.add_noise:
+                embeddings = add_noise_with_norm_control(
+                    embeddings=embeddings,
+                    noise_factor=self.noise_factor,
+                    norm_c=self.dp_config.norm_c,
+                    add_noise=True
+                )
+        return {
+            "embeddings": embeddings.cpu(),
+            "attention_mask": encodings["attention_mask"].cpu(),
+            "labels": torch.tensor(labels, dtype=torch.long)
         }
-        if "validation" in dataset:
-            eval_data = self._subset(dataset, "validation",
-                                     self.user_config.max_eval_samples)
-            payload["splits"].setdefault("validation", eval_data)
-        # 根据用户设置的样本大小，选定的最终数据集
-        return payload
-
-    def sanitize(self, payload: Dict) -> Dict:
-        # 对 payload 转换为 embeddings，然后加噪
-        text_col = payload["text_column"]
-        label_col = payload["label_column"]
-
-        sanitized_payload = {"splits": {}}
-
-        for split_name, split_data in payload["splits"].items():
-            texts = split_data[text_col]
-            labels = torch.tensor(split_data[label_col], dtype=torch.long)
-
-            # 如果启用自动估计且还未估计，用训练集估计 norm_c
-            if (self.gate_config.add_noise and
-                self.gate_config.auto_norm_c and
-                not self._norm_c_estimated and
-                split_name == "train"):
-                self._estimate_norm_c(texts)
-
-            sanitized_split = self._encode_split(texts)
-            sanitized_split["labels"] = labels
-            sanitized_payload["splits"][split_name] = sanitized_split
-
-            logger.info(
-                f"[算安保]-处理 {split_name} 数据集 -> embeddings 形式"
-                f"{' (已加噪)' if self.gate_config.add_noise else ''}"
-            )
-
-        self.payload = sanitized_payload
-        return sanitized_payload
-
-    def output(self) -> Gate2Compute:
-        output_content = Gate2Compute(model_name=self.user_config.model_name,
-                                      payload=self.payload)
-        return output_content
-
-    def _subset(self, dataset: Dict, split: str, limit: Optional[int]) -> Dict[str, List]:
-        data = dataset[split]
-        if limit is not None:
-            limit = min(limit, len(data))
-            data = data.select(range(limit))
-        return data.to_dict()
-
-    @torch.no_grad()
-    def _encode_split(self, texts: List[str]) -> Dict[str, torch.Tensor]:
-        encodings = self.tokenizer(
-            texts,
-            padding="max_length",
-            truncation=True,
-            max_length=self.gate_config.max_length,
-            return_tensors="pt"
-        )
-        base_model = self.model.base_model
-        outputs = base_model(
-            input_ids=encodings["input_ids"],
-            attention_mask=encodings["attention_mask"],
-            token_type_ids=encodings.get("token_type_ids"),
-            output_hidden_states=True,
-            return_dict=True
-        )
-        embeddings = outputs.hidden_states[0]
-
-        # 添加噪声
-        if self.gate_config.add_noise:
-            # Step 1: 范数裁剪
-            embeddings = _max_norm_clip(embeddings, self.gate_config.norm_c)
-
-            # Step 2: 添加高斯噪声
-            embeddings = _add_gaussian_noise(embeddings, self.noise_multiplier)
-
-        sanitized = {
-            "embeddings": embeddings.cpu(),  # [batch, seq, hidden]
-            "attention_mask": encodings["attention_mask"].cpu()
-        }
-        return sanitized
 
 
 # ------------------------------------------------------
@@ -367,11 +309,10 @@ class PrivacyGateway:
 # ------------------------------------------------------
 
 class EmbeddingDataset(TorchDataset):
-    def __init__(self, embeddings: torch.Tensor, attention_mask: torch.Tensor,
-                 labels: torch.Tensor):
-        self.embeddings = embeddings.float()
-        self.attention_mask = attention_mask.long()
-        self.labels = labels.long()
+    def __init__(self, split: Dict[str, torch.Tensor]):
+        self.embeddings = split["embeddings"].float()
+        self.attention_mask = split["attention_mask"].long()
+        self.labels = split["labels"].long()
 
     def __len__(self):
         return self.embeddings.size(0)
@@ -389,22 +330,17 @@ class ComputeServer:
         self.config = config
 
     def _build_dataset(self, split: Dict[str, torch.Tensor]) -> EmbeddingDataset:
-        return EmbeddingDataset(
-            embeddings=split["embeddings"],
-            attention_mask=split["attention_mask"],
-            labels=split["labels"]
-        )
+        return EmbeddingDataset(split)
 
-    def fine_tune(self) -> Dict:
+    def fine_tune(self) -> Dict[str, float]:
         set_seed(self.config.seed)
 
-        train_dataset = self._build_dataset(self.config.payload["splits"]["train"])
+        train_dataset = self._build_dataset(self.config.payload["train"])
 
-        eval_flag = False
+        eval_flag = "validation" in self.config.payload
         eval_dataset = None
-        if "validation" in self.config.payload["splits"]:
-            eval_flag = True
-            eval_dataset = self._build_dataset(self.config.payload["splits"]["validation"])
+        if eval_flag:
+            eval_dataset = self._build_dataset(self.config.payload["validation"])
 
         config = AutoConfig.from_pretrained(
             self.config.model_name,
@@ -424,7 +360,7 @@ class ComputeServer:
             num_train_epochs=self.config.num_train_epochs,
             logging_steps=self.config.logging_steps,
             eval_strategy="epoch" if eval_flag else "no",
-            save_strategy="epoch",
+            save_strategy="no",
             report_to="none",
             seed=self.config.seed
         )
@@ -441,12 +377,10 @@ class ComputeServer:
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset if eval_flag else None,
-            tokenizer=None,  # 我们直接传入 embeddings，不需要 tokenizer
-            data_collator=None,  # 数据集已是张量，默认 collate 足够
             compute_metrics=compute_metrics if eval_flag else None,
         )
 
-        logger.info(f"[算力网]-开始进行微调，样本规模为 {len(train_dataset)}")
+        logger.info(f"[算力网]-开始微调，训练样本规模： {len(train_dataset)}")
         train_result = trainer.train()
 
         metrics = {"train_loss": train_result.training_loss}
@@ -458,6 +392,23 @@ class ComputeServer:
             logger.info(f"验证结果：{eval_metrics}")
 
         return metrics
+
+
+def run_pipeline(user_config: UserClientConfig,
+                 gate_config: GatewayConfig, title: str) -> Dict[str, float]:
+    logger.info("\n" + "=" * 60)
+    logger.info(title)
+    logger.info("=" * 60)
+
+    gateway = PrivacyGateway(user_config=user_config, gate_config=gate_config)
+    raw_payload = gateway.load_data()
+    gateway.sanitize(raw_payload)
+    output = gateway.output()
+
+    server = ComputeServer(output)
+    metrics = server.fine_tune()
+    logger.info(f"{title} 结果：{metrics}")
+    return metrics
 
 
 if __name__ == '__main__':
@@ -473,84 +424,17 @@ if __name__ == '__main__':
         max_eval_samples=100,
     )
 
-    # 测试1: 不加噪声（基线）
-    logger.info("\n" + "="*60)
-    logger.info("测试 1: 不添加噪声（基线）")
-    logger.info("="*60)
-    gateway_no_noise = PrivacyGateway(
-        user_config=user_config,
-        gate_config=GatewayConfig(add_noise=False)
+    baseline_metrics = run_pipeline(
+        user_config,
+        gate_config=GatewayConfig(max_length=128, dp_config=None),
+        title="测试 1：不加噪测试"
     )
-    raw_payload = gateway_no_noise.load_data()
-    sanitized_payload = gateway_no_noise.sanitize(raw_payload)
-    output_content = gateway_no_noise.output()
 
-    server = ComputeServer(output_content)
-    metrics_no_noise = server.fine_tune()
-
-    # 测试2: 添加噪声（论文推荐：norm_c=1.0）
-    logger.info("\n" + "="*60)
-    logger.info("测试 2: 添加 DP 噪声 - 论文推荐方法 (norm_c=1.0, ε=8.0)")
-    logger.info("="*60)
-    gateway_paper_default = PrivacyGateway(
-        user_config=user_config,
+    dp_metrics = run_pipeline(
+        user_config,
         gate_config=GatewayConfig(
-            add_noise=True,
-            auto_norm_c=False,  # 使用论文推荐的固定值
-            norm_c=1.0,         # 论文推荐值
-            epsilon=8.0,
-            delta=1e-5,
-        )
+            max_length=128,
+            dp_config=DPConfig(epsilon=8.0, delta=1e-5, norm_c=5.0, add_noise=True)
+        ),
+        title="测试 2：添加 DP 噪声"
     )
-    raw_payload = gateway_paper_default.load_data()
-    sanitized_payload = gateway_paper_default.sanitize(raw_payload)
-    output_content = gateway_paper_default.output()
-
-    server = ComputeServer(output_content)
-    metrics_paper = server.fine_tune()
-
-    # 测试3: 添加噪声（自适应：auto norm_c with median）
-    logger.info("\n" + "="*60)
-    logger.info("测试 3: 添加 DP 噪声 - 自适应方法 (auto norm_c, 中位数, ε=8.0)")
-    logger.info("="*60)
-    gateway_adaptive = PrivacyGateway(
-        user_config=user_config,
-        gate_config=GatewayConfig(
-            add_noise=True,
-            auto_norm_c=True,       # 自动估计
-            norm_percentile=100,     # 使用中位数（而非90分位）
-            epsilon=8.0,
-            delta=1e-5,
-        )
-    )
-    raw_payload = gateway_adaptive.load_data()
-    sanitized_payload = gateway_adaptive.sanitize(raw_payload)
-    output_content = gateway_adaptive.output()
-
-    server = ComputeServer(output_content)
-    metrics_adaptive = server.fine_tune()
-
-    # 对比结果
-    logger.info("\n" + "="*70)
-    logger.info("最终结果对比")
-    logger.info("="*70)
-    logger.info(f"【基线】无噪声:              {metrics_no_noise}")
-    logger.info(f"【方法1】论文推荐(norm_c=1): {metrics_paper}")
-    logger.info(f"【方法2】自适应(中位数):     {metrics_adaptive}")
-
-    if "eval_accuracy" in metrics_no_noise:
-        baseline_acc = metrics_no_noise["eval_accuracy"]
-        logger.info("\n准确度对比：")
-        logger.info(f"  基线准确度: {baseline_acc*100:.2f}%")
-
-        if "eval_accuracy" in metrics_paper:
-            paper_acc = metrics_paper["eval_accuracy"]
-            paper_drop = (baseline_acc - paper_acc) * 100
-            logger.info(f"  论文方法:   {paper_acc*100:.2f}% (下降 {paper_drop:.2f}%)")
-
-        if "eval_accuracy" in metrics_adaptive:
-            adaptive_acc = metrics_adaptive["eval_accuracy"]
-            adaptive_drop = (baseline_acc - adaptive_acc) * 100
-            logger.info(f"  自适应方法: {adaptive_acc*100:.2f}% (下降 {adaptive_drop:.2f}%)")
-
-        logger.info("\n💡 建议: 如果论文方法准确度可接受，优先使用 norm_c=1.0（噪声更小，隐私保证更强）")
