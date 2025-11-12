@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 
 import logging
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
