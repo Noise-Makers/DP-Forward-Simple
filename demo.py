@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 
 import logging
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -186,7 +188,7 @@ class ComputeServer:
             labels=split["labels"]
         )
 
-    def fine_tune(self) -> Dict:
+    def fine_tune(self):
         set_seed(self.config.seed)
 
         train_dataset = self._build_dataset(self.config.payload["splits"]["train"])
