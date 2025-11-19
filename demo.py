@@ -2,7 +2,8 @@
 
 import logging
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"  # noqa: E402
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -32,7 +33,7 @@ def matrix_gaussian_noise(epsilon: float, delta: float, sensitivity: float) -> f
         sensitivity: 查询的敏感度
 
     Returns:
-        噪声因子
+        高斯分布的标准差
     """
     def function_phi(t):
         return (1 + math.erf(t / math.sqrt(2))) / 2
@@ -69,7 +70,7 @@ def matrix_gaussian_noise(epsilon: float, delta: float, sensitivity: float) -> f
 
 def _max_norm_clip(embeddings: torch.Tensor, norm_c: float = 1.0) -> torch.Tensor:
     """
-    对 embeddings 进行范数裁剪
+    对 embeddings 进行范数裁剪 （基于 token-level 定义）
 
     Args:
         embeddings: [batch_size, seq_len, hidden_dim]
@@ -78,17 +79,12 @@ def _max_norm_clip(embeddings: torch.Tensor, norm_c: float = 1.0) -> torch.Tenso
     Returns:
         裁剪后的 embeddings
     """
-    shape = embeddings.shape
-    # 将每个样本展平为一维向量
-    embeddings_flat = embeddings.reshape(shape[0], -1)
     # 计算每个样本的 L2 范数
-    total_norm = torch.norm(embeddings_flat, dim=-1)
+    total_norms = torch.norm(embeddings, dim=-1, keepdim=True)
     # 计算裁剪系数（只裁剪超过 norm_c 的）
-    clip_coef = norm_c / (total_norm + 1e-6)
-    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
-    # 应用裁剪
-    embeddings_flat = embeddings_flat * clip_coef_clamped.unsqueeze(-1)
-    return embeddings_flat.reshape(shape)
+    clip_coef = norm_c / (total_norms + 1e-6)
+    clip_coef = torch.clamp(clip_coef, max=1.0)
+    return embeddings * clip_coef
 
 
 def add_noise_with_norm_control(
@@ -98,7 +94,7 @@ def add_noise_with_norm_control(
     add_noise: bool = True
 ) -> torch.Tensor:
     """
-    添加高斯噪声，同时控制噪声向量的整体范数
+    添加 i.i.d. 高斯噪声
 
     Args:
         embeddings: 裁剪后的 embeddings
@@ -113,14 +109,13 @@ def add_noise_with_norm_control(
         return embeddings
 
     embeddings = _max_norm_clip(embeddings, norm_c)
-    noise = torch.randn_like(embeddings)
-
-    batch_size = embeddings.shape[0]
-    for i in range(batch_size):
-        noise_flat = noise[i].reshape(-1)
-        noise_norm = torch.norm(noise_flat)
-        if noise_norm > 1e-6:
-            noise[i] = noise[i] * (noise_factor / noise_norm)
+    noise = torch.normal(
+        mean=0.0,
+        std=noise_factor,
+        size=embeddings.shape,
+        device=embeddings.device,
+        dtype=embeddings.dtype
+    )
     return embeddings + noise
 
 
@@ -337,12 +332,13 @@ class ComputeServer:
     def fine_tune(self) -> Dict[str, float]:
         set_seed(self.config.seed)
 
-        train_dataset = self._build_dataset(self.config.payload["train"])
+        splits_dataset = self.config.payload["splits"]
+        train_dataset = self._build_dataset(splits_dataset["train"])
 
-        eval_flag = "validation" in self.config.payload
+        eval_flag = "validation" in splits_dataset
         eval_dataset = None
         if eval_flag:
-            eval_dataset = self._build_dataset(self.config.payload["validation"])
+            eval_dataset = self._build_dataset(splits_dataset["validation"])
 
         config = AutoConfig.from_pretrained(
             self.config.model_name,
@@ -422,8 +418,8 @@ if __name__ == '__main__':
         train_file="datasets/SST-2/train.tsv",
         validation_file="datasets/SST-2/dev.tsv",
         model_name="bert-base-uncased",
-        max_train_samples=200,   # 快速测试用少量样本
-        max_eval_samples=100,
+        max_train_samples=20,   # 快速测试用少量样本
+        max_eval_samples=10,
     )
 
     baseline_metrics = run_pipeline(
@@ -436,7 +432,7 @@ if __name__ == '__main__':
         user_config,
         gate_config=GatewayConfig(
             max_length=128,
-            dp_config=DPConfig(epsilon=8.0, delta=1e-5, norm_c=5.0, add_noise=True)
+            dp_config=DPConfig(epsilon=8.0, delta=1e-5, norm_c=1.0, add_noise=True)
         ),
         title="测试 2：添加 DP 噪声"
     )
